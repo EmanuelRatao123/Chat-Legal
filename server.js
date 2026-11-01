@@ -1,0 +1,159 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const { Pool } = require('pg');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+// Configuração do PostgreSQL (O Render fornecerá a variável DATABASE_URL)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false // Necessário para conexões externas/Render
+  }
+});
+
+// Criar tabela de mensagens caso não exista ao iniciar o servidor
+pool.query(`
+  CREATE TABLE IF NOT EXISTS messages (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) NOT NULL,
+    text TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )
+`).then(() => console.log('Tabela de mensagens pronta.'))
+  .catch(err => console.error('Erro ao criar tabela:', err));
+
+// Frontend embutido no backend para facilitar o deploy (Single File)
+const htmlContent = `
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chat Global</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; background: #e9ecef; }
+    header { background: #007bff; color: white; padding: 15px; text-align: center; font-size: 1.2rem; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    #chat-container { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 10px; }
+    .message { background: white; padding: 10px 15px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); align-self: flex-start; max-width: 80%; }
+    .message.me { align-self: flex-end; background: #d1e7dd; }
+    .username { font-size: 0.8rem; font-weight: bold; color: #495057; margin-bottom: 4px; }
+    #form-container { background: white; padding: 15px; box-shadow: 0 -2px 5px rgba(0,0,0,0.05); display: flex; gap: 10px; }
+    input[type="text"] { flex: 1; padding: 10px; border: 1px solid #ced4da; border-radius: 4px; outline: none; }
+    input[type="text"]:focus { border-color: #007bff; }
+    button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; transition: background 0.2s; }
+    button:hover { background: #0056b3; }
+    #setup-modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: flex; justify-content: center; align-items: center; z-index: 100; }
+    #setup-content { background: white; padding: 30px; border-radius: 8px; text-align: center; width: 90%; max-width: 400px; }
+  </style>
+</head>
+<body>
+
+  <div id="setup-modal">
+    <div id="setup-content">
+      <h2>Bem-vindo ao Chat Global</h2>
+      <p>Digite seu nome para entrar:</p>
+      <input type="text" id="username-input" placeholder="Seu nome..." style="width: 100%; box-sizing: border-box; margin-bottom: 15px;">
+      <button onclick="joinChat()" style="width: 100%;">Entrar</button>
+    </div>
+  </div>
+
+  <header>💬 Chat Global Render</header>
+  <div id="chat-container"></div>
+  <form id="form-container" onsubmit="sendMessage(event)">
+    <input type="text" id="message-input" autocomplete="off" placeholder="Digite sua mensagem..." disabled />
+    <button type="submit" id="send-btn" disabled>Enviar</button>
+  </form>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    let myUsername = '';
+    const chatContainer = document.getElementById('chat-container');
+    const messageInput = document.getElementById('message-input');
+    const sendBtn = document.getElementById('send-btn');
+    const setupModal = document.getElementById('setup-modal');
+
+    function joinChat() {
+      const input = document.getElementById('username-input');
+      if (input.value.trim()) {
+        myUsername = input.value.trim();
+        setupModal.style.display = 'none';
+        messageInput.disabled = false;
+        sendBtn.disabled = false;
+        messageInput.focus();
+      }
+    }
+
+    function addMessageToUI(username, text) {
+      const msgDiv = document.createElement('div');
+      msgDiv.className = 'message ' + (username === myUsername ? 'me' : '');
+      msgDiv.innerHTML = \`<div class="username">\${username}</div><div>\${text}</div>\`;
+      chatContainer.appendChild(msgDiv);
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+
+    // Carregar mensagens antigas
+    socket.on('load messages', (messages) => {
+      messages.forEach(msg => addMessageToUI(msg.username, msg.text));
+    });
+
+    // Receber nova mensagem
+    socket.on('chat message', (msg) => {
+      addMessageToUI(msg.username, msg.text);
+    });
+
+    // Enviar mensagem
+    function sendMessage(e) {
+      e.preventDefault();
+      if (messageInput.value.trim() && myUsername) {
+        socket.emit('chat message', { username: myUsername, text: messageInput.value });
+        messageInput.value = '';
+      }
+    }
+  </script>
+</body>
+</html>
+`;
+
+// Rota principal para servir o frontend
+app.get('/', (req, res) => {
+  res.send(htmlContent);
+});
+
+// Lógica de tempo real e Banco de Dados
+io.on('connection', async (socket) => {
+  console.log('Novo usuário conectado');
+
+  // Enviar as últimas 50 mensagens ao conectar
+  try {
+    const result = await pool.query('SELECT username, text FROM messages ORDER BY created_at ASC LIMIT 50');
+    socket.emit('load messages', result.rows);
+  } catch (err) {
+    console.error('Erro ao buscar mensagens:', err);
+  }
+
+  // Ouvir novas mensagens
+  socket.on('chat message', async (msg) => {
+    try {
+      // Salvar no banco PostgreSQL
+      await pool.query('INSERT INTO messages (username, text) VALUES ($1, $2)', [msg.username, msg.text]);
+      // Transmitir para todos os usuários conectados
+      io.emit('chat message', msg);
+    } catch (err) {
+      console.error('Erro ao salvar mensagem:', err);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Usuário desconectado');
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(\`Servidor rodando na porta \${PORT}\`);
+});
